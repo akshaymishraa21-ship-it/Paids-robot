@@ -123,6 +123,13 @@ class EditGiveaway(StatesGroup):
 class TopupAdmin(StatesGroup):
     waiting_for_amount = State()
 
+class WithdrawFlow(StatesGroup):
+    waiting_for_wallet = State()
+
+class ManageBalance(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_new_balance = State()
+
 
 def is_admin(user):
     if not user:
@@ -522,17 +529,17 @@ async def cmd_manage_giveaways(message: Message):
     await message.reply(text, parse_mode="Markdown")
 
 
-# --- NEW WALLET, TIP, BALANCE, WITHDRAW & TOPUP COMMANDS ---
+# --- WALLET, TIP, BALANCE, WITHDRAW & TOPUP COMMANDS ---
 
 @dp.message(Command("tip"))
 async def cmd_tip(message: Message):
     if is_admin(message.from_user):
         if not message.reply_to_message:
-            return await message.reply("⚠️ Usage: Reply to a user's message with `/tip <amount>` (e.g. `/tip 100$`)")
+            return await message.reply("⚠️ Usage: Reply to a user's message with `/tip <amount>` (e.g. `/tip 2$`)")
         
         parts = message.text.split()
         if len(parts) < 2:
-            return await message.reply("⚠️ Please specify the amount, e.g. `/tip 100$`")
+            return await message.reply("⚠️ Please specify the amount, e.g. `/tip 2$`")
         
         try:
             amount_val = float("".join(filter(lambda c: c.isdigit() or c == '.', parts[1])))
@@ -549,7 +556,31 @@ async def cmd_tip(message: Message):
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (target_id,))
         new_bal = cursor.fetchone()[0]
         
-        await message.reply(f"✅ Successfully tipped **${amount_val:.2f}** to @{target_uname}!\nNew Balance: **${new_bal:.2f}**", parse_mode="Markdown")
+        sender_uname = message.from_user.username or message.from_user.first_name
+        
+        # Notify recipient in DM
+        party_emoji_id = "5461151367559141950"
+        dm_text = f'🎉 <tg-emoji emoji-id="{party_emoji_id}">🎉</tg-emoji> Congratulations! You received a **${amount_val:.2f}** tip from @{sender_uname}!\nNew Balance: **${new_bal:.2f}**'
+        try:
+            await bot.send_message(target_id, dm_text, parse_mode="HTML")
+        except Exception:
+            pass
+            
+        # Broadcast notification in chat
+        hug_emoji_id = "5008248651038852115"
+        point_emoji_id = "4974529275114816593"
+        bot_info = await bot.get_me()
+        claim_link = f"https://t.me/{bot_info.username}?start=claim"
+        
+        chat_msg = (
+            f"<b>@{sender_uname}</b> tipped 🫂 <tg-emoji emoji-id=\"{hug_emoji_id}\">🫂</tg-emoji> "
+            f"<b>${amount_val:.2f}</b> to <b>@{target_uname}</b>!\n\n"
+            f"Claim them by starting me in dm 👉 <tg-emoji emoji-id=\"{point_emoji_id}\">👉</tg-emoji>"
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🚀 Start Bot in DM", url=claim_link)]]
+        )
+        await message.reply(chat_msg, reply_markup=markup, parse_mode="HTML")
     else:
         user_id = message.from_user.id
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
@@ -568,8 +599,24 @@ async def cmd_balance(message: Message):
 
 
 @dp.message(Command("withdraw"))
-async def cmd_withdraw(message: Message):
-    await message.reply("⚠️ You can only withdraw after **$200** balance!", parse_mode="Markdown")
+async def cmd_withdraw(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    balance = row[0] if row else 0.0
+    
+    if balance < 200:
+        return await message.reply("⚠️ You can only withdraw after **$200** balance!", parse_mode="Markdown")
+        
+    await state.set_state(WithdrawFlow.waiting_for_wallet)
+    await message.reply("💸 Your balance is $200 or more! Please send your **Gram wallet address** to proceed with the withdrawal:")
+
+
+@dp.message(WithdrawFlow.waiting_for_wallet)
+async def process_withdraw_wallet(message: Message, state: FSMContext):
+    wallet_addr = message.text.strip()
+    await state.clear()
+    await message.reply(f"🚀 **Withdrawal Processing!**\n\nSending $200.00 to Gram wallet:\n`{wallet_addr}`\n\n*(Joke: Transaction successful! 🤑🎉)*", parse_mode="Markdown")
 
 
 @dp.message(Command("topup"))
@@ -578,7 +625,8 @@ async def cmd_topup(message: Message, state: FSMContext):
         await state.set_state(TopupAdmin.waiting_for_amount)
         await message.reply("💵 How much balance would you like to top up for yourself? (Send amount like `200` or `200$`):")
     else:
-        await message.reply("💳 **Top Up Instructions:**\nPlease send the exact money within a few seconds to:\n`Disturborme.ton`\n\nOnce received, the admin will verify and credit your balance via `/tip`!", parse_mode="Markdown")
+        await message.reply("💳 **Top Up Instructions:**\nPlease send the exact money within a few seconds to:\n`Disturborme.ton`\n\n*(Note: Please only receive Gram!)*\n\nOnce received, the admin will verify and credit your balance via `/tip`!", parse_mode="Markdown")
+
 
 @dp.message(TopupAdmin.waiting_for_amount)
 async def process_admin_topup(message: Message, state: FSMContext):
@@ -603,6 +651,80 @@ async def process_admin_topup(message: Message, state: FSMContext):
     
     await state.clear()
     await message.reply(f"✅ Your balance has been topped up by **${amount:.2f}**!\nYour New Balance: **${new_bal:.2f}**", parse_mode="Markdown")
+
+
+@dp.message(Command("guys"))
+async def cmd_guys(message: Message):
+    if not is_admin(message.from_user):
+        return
+    cursor.execute("SELECT username, balance FROM user_balances WHERE balance > 0 ORDER BY balance DESC")
+    rows = cursor.fetchall()
+    
+    if not rows:
+        return await message.reply("📋 No users have a balance in their wallet yet.")
+        
+    txt = "👥 **Users with Wallet Balances:**\n\n"
+    for uname, bal in rows:
+        display_name = f"@{uname}" if uname else "Unknown"
+        txt += f"🔹 {display_name} — **${bal:.2f}**\n"
+    await message.reply(txt, parse_mode="Markdown")
+
+
+@dp.message(Command("manage"))
+async def cmd_manage(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    await state.set_state(ManageBalance.waiting_for_target)
+    await message.reply("🛠 **Manage Balances**\n\nPlease send the `@username` or user ID of the person whose balance you want to edit:")
+
+
+@dp.message(ManageBalance.waiting_for_target)
+async def process_manage_target(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    target_query = message.text.strip().replace("@", "")
+    
+    cursor.execute("SELECT user_id, username, balance FROM user_balances WHERE LOWER(username)=? OR user_id=?", (target_query.lower(), target_query if target_query.isdigit() else 0))
+    row = cursor.fetchone()
+    
+    if not row:
+        try:
+            uid_val = int(target_query)
+            cursor.execute("SELECT user_id, username, balance FROM user_balances WHERE user_id=?", (uid_val,))
+            row = cursor.fetchone()
+        except ValueError:
+            pass
+            
+    if not row:
+        await state.clear()
+        return await message.reply("⚠️ User not found in database balances. Try again or /cancel.")
+        
+    await state.update_data(manage_user_id=row[0], manage_username=row[1])
+    await state.set_state(ManageBalance.waiting_for_new_balance)
+    await message.reply(f"👤 Found user @{row[1]} (Current Balance: **${row[2]:.2f}**)\n\nSend the **new balance amount** (e.g., `150`):", parse_mode="Markdown")
+
+
+@dp.message(ManageBalance.waiting_for_new_balance)
+async def process_manage_new_balance(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+        
+    try:
+        new_bal = float("".join(filter(lambda c: c.isdigit() or c == '.', message.text.strip())))
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid number.")
+        
+    data = await state.get_data()
+    uid = data["manage_user_id"]
+    uname = data["manage_username"]
+    
+    cursor.execute("UPDATE user_balances SET balance=? WHERE user_id=?", (new_bal, uid))
+    conn.commit()
+    await state.clear()
+    
+    await message.reply(f"✅ Successfully updated @{uname}'s balance to **${new_bal:.2f}**!", parse_mode="Markdown")
 
 
 @dp.message(Command("addstars"))
@@ -1037,7 +1159,7 @@ async def update_live_post(gw_id):
             pass
 
 
-# --- UNIVERSAL /START HANDLER (PM Entry & Referrals) ---
+# --- UNIVERSAL /START HANDLER (PM Entry, Referrals & Claims) ---
 @dp.message(Command("start"))
 async def handle_start_referral(message: Message):
     args = message.text.split()
@@ -1047,7 +1169,13 @@ async def handle_start_referral(message: Message):
     if len(args) > 1:
         param = args[1]
         
-        if param.startswith("enter_"):
+        if param == "claim":
+            cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            bal = row[0] if row else 0.0
+            return await message.reply(f"🎁 **Claim Center**\nYour current wallet balance is: **${bal:.2f}**\nUse `/balance` or `/withdraw` anytime!", parse_mode="Markdown")
+        
+        elif param.startswith("enter_"):
             try:
                 gw_id = int(param.split("_")[1])
             except ValueError:
