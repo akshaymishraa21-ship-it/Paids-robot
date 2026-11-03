@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from keep_alive import keep_alive
 
 BOT_TOKEN = os.environ.get(
-    "BOT_TOKEN", "8488349023:AAG75msvlzTzeFbgXe4_8SnHldKEycgfLq8"
+    "BOT_TOKEN", "8488349023:AAHwL6XtncTeyewAGXf_acu1i8g9MTIGTZk"
 )
 OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "6146191046"))
 STARS_PER_POST = 400
@@ -1044,3 +1044,482 @@ async def process_repost_target(message: Message, state: FSMContext):
     )
 
     target_chats = []
+    if target.lower() == "all":
+        cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
+        target_chats = [row[0] for row in cursor.fetchall()]
+    else:
+        try:
+            target_chats = [int(target)]
+        except ValueError:
+            cursor.execute(
+                "SELECT chat_id FROM connected_groups WHERE LOWER(username)=? OR LOWER(title) LIKE ?",
+                (target.replace("@", "").lower(), f"%{target.lower()}%")
+            )
+            res = cursor.fetchone()
+            if res:
+                target_chats = [res[0]]
+
+    if not target_chats:
+        return await message.reply(f"⚠️ No matching active group found for '{target}'. Use `/connection` to check group usernames/IDs.")
+
+    cursor.execute("SELECT message_data FROM giveaways WHERE id=?", (gw_id,))
+    existing_msg_data_raw = cursor.fetchone()
+    msg_data = json.loads(existing_msg_data_raw[0]) if existing_msg_data_raw and existing_msg_data_raw[0] else {}
+
+    for chat_id in target_chats:
+        try:
+            sent = await bot.send_photo(
+                chat_id=chat_id,
+                photo=gw[0],
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            msg_data[str(chat_id)] = sent.message_id
+        except Exception:
+            pass
+
+    cursor.execute(
+        "UPDATE giveaways SET message_data=? WHERE id=?", (json.dumps(msg_data), gw_id)
+    )
+    conn.commit()
+    await message.reply(
+        f"✅ Giveaway #{gw_id} successfully reposted to {len(target_chats)} group(s) with {entries_count} entries retained!"
+    )
+
+
+# --- REDIRECT GIVEAWAY ENTRY TO PM ---
+@dp.callback_query(lambda c: c.data and c.data.startswith("enter_gw_"))
+async def handle_gw_entry_redirect(callback_query: CallbackQuery):
+    gw_id = int(callback_query.data.split("_")[2])
+    bot_info = await bot.get_me()
+    
+    start_payload = f"https://t.me/{bot_info.username}?start=enter_{gw_id}"
+    
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Click here to Enter", url=start_payload)],
+            [InlineKeyboardButton(text=callback_query.message.reply_markup.inline_keyboard[0][0].text, callback_data=f"enter_gw_{gw_id}")]
+        ]
+    )
+    
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
+
+    await callback_query.answer(
+        "✨ Tap the button below to register your entry and get your invite link in PM!", 
+        show_alert=True
+    )
+
+
+async def update_live_post(gw_id):
+    cursor.execute(
+        "SELECT photo_id, description, end_time, max_participants, max_winners, button_text, message_data, status, sponsor_channel FROM giveaways WHERE id=?",
+        (gw_id,),
+    )
+    gw = cursor.fetchone()
+    if not gw or gw[7] != "active":
+        return
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=?", (gw_id,)
+    )
+    entries_count = cursor.fetchone()[0]
+
+    time_left = datetime.fromisoformat(gw[2]) - datetime.now()
+    fake_mins = max(0, int(time_left.total_seconds() / 60) + random.randint(-2, 2))
+    hours_left = fake_mins // 60
+    mins_left = fake_mins % 60
+
+    caption = f"🎁 **NEW GIVEAWAY** 🎁\n\n{gw[1]}\n\n⏳ Ends in: **{hours_left}h {mins_left}m**\n👥 Entries: {entries_count} / {gw[3]}\n🏆 Winners: {gw[4]}"
+    if gw[8] and gw[8].lower() != "none":
+        caption += f"\n\n⚠️ **Required:** You must join {gw[8]} to enter!"
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=gw[5], callback_data=f"enter_gw_{gw_id}")]
+        ]
+    )
+    msg_data = json.loads(gw[6])
+
+    for chat_id, msg_id in msg_data.items():
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+# --- UNIVERSAL /START HANDLER (PM Entry, Referrals & Claims) ---
+@dp.message(Command("start"))
+async def handle_start_referral(message: Message):
+    args = message.text.split()
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+
+    if len(args) > 1:
+        param = args[1]
+        
+        if param == "claim":
+            cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            bal = row[0] if row else 0.0
+            return await message.reply(f"🎁 **Claim Center**\nYour current wallet balance is: **${bal:.2f}**\nUse `/balance` or `/withdraw` anytime!", parse_mode="Markdown")
+        
+        elif param.startswith("enter_"):
+            try:
+                gw_id = int(param.split("_")[1])
+            except ValueError:
+                return await message.reply("⚠️ Invalid giveaway payload.")
+            
+            cursor.execute("SELECT status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+            gw = cursor.fetchone()
+            if not gw or gw[0] != "active":
+                return await message.reply("⚠️ This giveaway has already ended!")
+
+            sponsor_channel = gw[1]
+            if sponsor_channel and sponsor_channel.lower() != "none":
+                try:
+                    member = await bot.get_chat_member(chat_id=sponsor_channel, user_id=user_id)
+                    if member.status in ["left", "kicked", "restricted"]:
+                        return await message.reply(f"⚠️ You must join {sponsor_channel} first to enter this giveaway!")
+                except Exception:
+                    return await message.reply(f"⚠️ You must join {sponsor_channel} first! (Bot lacks admin rights there).")
+
+            bot_info = await bot.get_me()
+            ref_link = f"https://t.me/{bot_info.username}?start=ref_{gw_id}_{user_id}"
+
+            try:
+                cursor.execute(
+                    "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, NULL)",
+                    (gw_id, user_id, username),
+                )
+                conn.commit()
+                await message.reply(
+                    f"✅ **Entry Recorded Successfully!**\n\n"
+                    f"Share your unique invite link with friends to get extra tickets and boost your winning chances:\n`{ref_link}`\n\n"
+                    f"Current Tickets: **1**",
+                    parse_mode="Markdown"
+                )
+                await update_live_post(gw_id)
+            except sqlite3.IntegrityError:
+                cursor.execute("SELECT tickets FROM giveaway_entries WHERE giveaway_id=? AND user_id=?", (gw_id, user_id))
+                t_row = cursor.fetchone()
+                current_tickets = t_row[0] if t_row else 1
+                await message.reply(
+                    f"⚠️ You have already entered this giveaway!\n\nYour invite link:\n`{ref_link}`\n\nCurrent Tickets: **{current_tickets}**",
+                    parse_mode="Markdown"
+                )
+
+        elif param.startswith("ref_"):
+            parts = param.split("_")
+            try:
+                gw_id = int(parts[1])
+                referrer_id = int(parts[2])
+            except ValueError:
+                return await message.reply("⚠️ Invalid referral link.")
+
+            if user_id == referrer_id:
+                return await message.reply("⚠️ You cannot refer yourself!")
+
+            cursor.execute("SELECT sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+            gw = cursor.fetchone()
+
+            if gw and gw[0] and gw[0].lower() != "none":
+                try:
+                    member = await bot.get_chat_member(chat_id=gw[0], user_id=user_id)
+                    if member.status in ["left", "kicked", "restricted"]:
+                        return await message.reply(f"⚠️ You must join {gw[0]} first before using this referral link!")
+                except Exception:
+                    return await message.reply(f"⚠️ You must join {gw[0]} first!")
+
+            try:
+                cursor.execute(
+                    "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, ?)",
+                    (gw_id, user_id, username, referrer_id),
+                )
+                cursor.execute(
+                    "UPDATE giveaway_entries SET tickets = tickets + 1 WHERE giveaway_id=? AND user_id=?",
+                    (gw_id, referrer_id),
+                )
+                conn.commit()
+
+                await message.reply("✅ You successfully entered the giveaway via a referral link!")
+                try:
+                    await bot.send_message(referrer_id, "🎉 Someone joined using your link! You earned +1 Ticket.")
+                except Exception:
+                    pass
+
+                await update_live_post(gw_id)
+            except sqlite3.IntegrityError:
+                await message.reply("⚠️ You have already entered this giveaway!")
+    else:
+        await message.reply(
+            "👋 Welcome! Use the buttons in the main groups to enter giveaways."
+        )
+
+
+@dp.message(Command("entry"))
+async def cmd_entry(message: Message):
+    if not is_admin(message.from_user):
+        return
+    args = message.text.split()
+    if len(args) == 1:
+        cursor.execute("SELECT id, description, status FROM giveaways")
+        gws = cursor.fetchall()
+        if not gws:
+            return await message.reply("No giveaways found.")
+        res = "📋 **Giveaways:**\n" + "\n".join(
+            [f"ID: `{g[0]}` | {g[2].upper()} | {g[1][:20]}..." for g in gws]
+        )
+        return await message.reply(
+            res + "\n\nUse `/entry <ID>` for details.", parse_mode="Markdown"
+        )
+
+    gw_id = int(args[1])
+    cursor.execute(
+        "SELECT COUNT(*), SUM(tickets) FROM giveaway_entries WHERE giveaway_id=?",
+        (gw_id,),
+    )
+    stats = cursor.fetchone()
+    cursor.execute(
+        "SELECT username, tickets FROM giveaway_entries WHERE giveaway_id=? ORDER BY tickets DESC LIMIT 5",
+        (gw_id,),
+    )
+    top_refs = cursor.fetchall()
+
+    txt = f"📊 **Giveaway #{gw_id} Stats:**\n\nTotal People: {stats[0]}\nTotal Tickets: {stats[1] or 0}\n\n**Top Referrers:**\n"
+    for u, t in top_refs:
+        txt += f"@{u} - {t} Tickets\n"
+    await message.reply(txt)
+
+
+# --- AUTO-WINNER SELECTION & OWNER NOTIFICATION ---
+async def auto_select_and_notify_winners(gw_id: int):
+    cursor.execute("SELECT user_id, username, tickets FROM giveaway_entries WHERE giveaway_id=?", (gw_id,))
+    entries = cursor.fetchall()
+    
+    if not entries:
+        try:
+            await bot.send_message(OWNER_ID, f"⚠️ Giveaway #{gw_id} ended, but there were no participants.")
+        except Exception:
+            pass
+        return
+
+    cursor.execute("SELECT max_winners FROM giveaways WHERE id=?", (gw_id,))
+    res = cursor.fetchone()
+    max_winners = res[0] if res else 1
+
+    pool = []
+    for user_id, username, tickets in entries:
+        for _ in range(max(1, tickets)):
+            pool.append((user_id, username))
+            
+    random.shuffle(pool)
+    
+    chosen_winners = []
+    seen_users = set()
+    for uid, uname in pool:
+        if uid not in seen_users:
+            seen_users.add(uid)
+            chosen_winners.append(f"@{uname}" if uname else f"User {uid}")
+            if len(chosen_winners) >= max_winners:
+                break
+
+    winners_str = " ".join(chosen_winners)
+    
+    cursor.execute("UPDATE giveaways SET status='ended' WHERE id=?", (gw_id,))
+    conn.commit()
+
+    notification_text = (
+        f"🤖 **Auto-Winner Selection for Giveaway #{gw_id}**\n\n"
+        f"Selected Winners:\n`{winners_str}`\n\n"
+        f"To announce this in groups, use:\n`/winner {gw_id} {winners_str}`"
+    )
+    try:
+        await bot.send_message(OWNER_ID, notification_text, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+@dp.message(Command("winner"))
+async def cmd_winner(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        return await message.reply(
+            "⚠️ Usage: `/winner <giveaway_id> @username1 @username2...`",
+            parse_mode="Markdown",
+        )
+
+    gw_id = int(parts[1])
+    winners_list = " ".join(parts[2:])
+
+    cursor.execute("UPDATE giveaways SET status='ended' WHERE id=?", (gw_id,))
+    conn.commit()
+
+    cursor.execute(
+        "SELECT photo_id, description, message_data FROM giveaways WHERE id=?", (gw_id,),
+    )
+    gw = cursor.fetchone()
+    if not gw:
+        return await message.reply("⚠️ Giveaway ID not found.")
+
+    caption = f"🏁 **GIVEAWAY ENDED** 🏁\n\n{gw[1]}\n\n🎉 **WINNERS:**\n{winners_list}\n\nCongratulations! DM the owner to claim your prize."
+    msg_data = json.loads(gw[2])
+
+    success = 0
+    for chat_id, msg_id in msg_data.items():
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=msg_id, caption=caption, parse_mode="HTML"
+            )
+            success += 1
+        except Exception:
+            pass
+
+    await message.reply(
+        f"✅ Giveaway #{gw_id} ended. Winners `{winners_list}` successfully announced in {success} groups!",
+        parse_mode="Markdown",
+    )
+
+
+# --- CORE TRACKING & MAIN ---
+@dp.message()
+async def track_stars(message: Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+        
+    cursor.execute(
+        "INSERT OR REPLACE INTO connected_groups (chat_id, title, username) VALUES (?, ?, ?)",
+        (message.chat.id, message.chat.title, message.chat.username)
+    )
+    conn.commit()
+
+    if message.from_user.is_bot:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    cursor.execute("SELECT 1 FROM counted_groups WHERE chat_id=?", (message.chat.id,))
+    if not cursor.fetchone():
+        return
+
+    try:
+        member = await bot.get_chat_member(
+            chat_id=message.chat.id, user_id=message.from_user.id
+        )
+        if member.status in ["administrator", "creator"]:
+            return
+    except Exception:
+        pass
+
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    cursor.execute(
+        "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
+        (user_id, username, STARS_PER_POST, datetime.now()),
+    )
+    conn.commit()
+    await update_live_messages()
+
+    try:
+        await message.react(
+            [
+                ReactionTypeEmoji(emoji="❤"),
+                ReactionTypeEmoji(emoji="👍"),
+                ReactionTypeEmoji(emoji="🔥"),
+            ]
+        )
+    except Exception:
+        try:
+            emojis = ["❤", "👍", "🔥", "⚡"]
+            chosen = random.choice(emojis)
+            await message.react([ReactionTypeEmoji(emoji=chosen)])
+        except Exception:
+            pass
+
+
+async def send_winner_announcement():
+    cursor.execute("SELECT chat_id FROM live_messages")
+    chats = set(row[0] for row in cursor.fetchall())
+    if not chats:
+        return False
+
+    one_week_ago = datetime.now() - timedelta(days=7)
+    cursor.execute(
+        "SELECT username, SUM(stars) as total FROM spenders WHERE timestamp >= ? GROUP BY LOWER(username) ORDER BY total DESC LIMIT 1",
+        (one_week_ago,),
+    )
+    winner = cursor.fetchone()
+
+    if not winner:
+        cursor.execute(
+            "SELECT username, SUM(stars) as total FROM spenders GROUP BY LOWER(username) ORDER BY total DESC LIMIT 1"
+        )
+        winner = cursor.fetchone()
+
+    if winner:
+        msg = f"🎉 WINNER ANNOUNCEMENT! 🎉\n\nCongratulations to @{winner[0]} for being #1 with {format_stars(winner[1])} Stars! 🥇\n\nYou have won a FREE advertisement in @Joiwi ✅ Please contact the owner to redeem your prize."
+        formatted_msg = apply_premium_emojis(msg)
+        for chat_id in chats:
+            try:
+                await bot.send_message(chat_id, formatted_msg, parse_mode="HTML")
+            except Exception:
+                pass
+        return True
+    return False
+
+
+async def daily_announcement():
+    cursor.execute("SELECT chat_id FROM live_messages")
+    chats = set(row[0] for row in cursor.fetchall())
+    if not chats:
+        return
+    cursor.execute(
+        "SELECT username, SUM(stars) as total FROM spenders GROUP BY LOWER(username) ORDER BY total DESC LIMIT 1"
+    )
+    top_user = cursor.fetchone()
+    if top_user:
+        msg = f"🏆 Daily Top Spender Update! 🎉\n\nOur biggest supporter is @{top_user[0]} with {format_stars(top_user[1])} Stars! 🥇"
+        formatted_msg = apply_premium_emojis(msg)
+        for chat_id in chats:
+            try:
+                await bot.send_message(chat_id, formatted_msg, parse_mode="HTML")
+            except Exception:
+                pass
+
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent):
+    if "Too Many Requests" in str(event.exception) or "Retry in" in str(
+        event.exception
+    ):
+        return
+    error_msg = f"⚠️ **Bot Error Alert** ⚠️\n\n`{event.exception}`"
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=error_msg)
+    except Exception:
+        pass
+
+
+async def main():
+    scheduler.add_job(daily_announcement, "cron", hour=12, minute=0)
+    scheduler.add_job(
+        send_winner_announcement, "cron", day_of_week="sun", hour=12, minute=0
+    )
+    scheduler.start()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    keep_alive()
+    asyncio.run(main())
