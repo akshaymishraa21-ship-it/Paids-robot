@@ -271,4 +271,1043 @@ async def cancel_fsm(message: Message, state: FSMContext):
 
 @dp.message(Command("make"))
 async def cmd_make(message: Message, state: FSMContext):
-    if not is_admin(message.from_
+    if not is_admin(message.from_user): return
+    await state.set_state(MakePost.waiting_for_paragraph)
+    await message.reply("📝 **Broadcast Mode**\n\nSend the paragraph you want to broadcast.")
+
+@dp.message(MakePost.waiting_for_paragraph)
+async def process_make(message: Message, state: FSMContext):
+    text = apply_premium_emojis(message.html_text or message.text)
+    conn, cursor = get_db()
+    cursor.execute("SELECT chat_id FROM connected_groups")
+    groups = cursor.fetchall()
+    conn.close()
+    bot_info = await bot.get_me()
+    success = 0
+    for group in groups:
+        chat_id = group[0]
+        try:
+            member = await bot.get_chat_member(chat_id, bot_info.id)
+            if member.status == "administrator":
+                await bot.send_message(chat_id, text, parse_mode="HTML")
+                success += 1
+        except Exception: 
+            pass
+    await state.clear()
+    await message.reply(f"✅ Custom broadcast successfully sent to {success} admin groups!")
+
+@dp.message(Command("getemoji"))
+async def get_emoji_id(message: Message):
+    if not is_admin(message.from_user): return
+    entities = message.entities or []
+    if message.reply_to_message and message.reply_to_message.entities:
+        entities.extend(message.reply_to_message.entities)
+    custom_emojis = [e.custom_emoji_id for e in entities if e.type == 'custom_emoji']
+    if custom_emojis:
+        res = "\n".join([f"`{eid}`" for eid in set(custom_emojis)])
+        await message.reply(f"🔍 **Premium Emoji IDs found:**\n{res}", parse_mode="Markdown")
+    else:
+        await message.reply("⚠️ No premium emojis detected.")
+
+@dp.message(Command("count"))
+async def cmd_count(message: Message):
+    if not is_admin(message.from_user):
+        return
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.reply("⚠️ Use this command in a group.")
+    conn, cursor = get_db()
+    cursor.execute("SELECT 1 FROM counted_groups WHERE chat_id=?", (message.chat.id,))
+    if cursor.fetchone():
+        cursor.execute("DELETE FROM counted_groups WHERE chat_id=?", (message.chat.id,))
+        conn.commit()
+        conn.close()
+        await message.reply("⏸️ Bot stopped counting messages in this group.")
+    else:
+        cursor.execute("INSERT INTO counted_groups (chat_id) VALUES (?)", (message.chat.id,))
+        conn.commit()
+        conn.close()
+        await message.reply("▶️ Bot is now officially counting messages and giving stars in this group!")
+
+
+@dp.message(Command("live"))
+async def cmd_live(message: Message):
+    if not is_admin(message.from_user):
+        return
+    conn, cursor = get_db()
+    cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
+    groups = cursor.fetchall()
+    conn.close()
+    if not groups:
+        return await message.reply("⚠️ The bot is not active anywhere. Use `/invest` to start.")
+    active_count = len(groups)
+    group_list = []
+    for group in groups:
+        chat_id = group[0]
+        try:
+            chat = await bot.get_chat(chat_id)
+            group_name = f"@{chat.username}" if chat.username else f"{chat.title} (Private)"
+            group_list.append(f"🔹 {group_name}")
+        except Exception:
+            group_list.append(f"🔹 Unknown Group (ID: {chat_id})")
+    list_str = "\n".join(group_list)
+    await message.reply(f"✅ **{active_count} group(s) active:**\n\n{list_str}", parse_mode="Markdown")
+
+
+@dp.message(Command("resetall"))
+async def reset_database(message: Message):
+    if not is_admin(message.from_user):
+        return
+    conn, cursor = get_db()
+    cursor.execute("DELETE FROM spenders")
+    cursor.execute("DELETE FROM sqlite_sequence WHERE name='spenders'")
+    conn.commit()
+    conn.close()
+    await update_live_messages()
+    await message.reply("✅ All old stats and top members have been permanently deleted!")
+
+
+@dp.message(Command("edit"))
+async def edit_spenders(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.reply("⚠️ Usage: /edit @username new_amount")
+    username = parts[1].replace("@", "")
+    try:
+        new_amount = int(parts[2])
+    except ValueError:
+        return await message.reply("⚠️ Amount must be a number.")
+    
+    conn, cursor = get_db()
+    cursor.execute("DELETE FROM spenders WHERE LOWER(username)=?", (username.lower(),))
+    if new_amount > 0:
+        cursor.execute(
+            "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
+            (0, username, new_amount, datetime.now()),
+        )
+        reply_msg = f"✅ Set @{username}'s total to {new_amount} Stars!"
+    else:
+        reply_msg = f"🗑 Removed @{username} from the leaderboard entirely."
+    conn.commit()
+    conn.close()
+    await update_live_messages()
+    await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
+
+
+@dp.message(Command("editgw"))
+async def cmd_edit_giveaway(message: Message, state: FSMContext):
+    if not is_admin(message.from_user): 
+        return
+    conn, cursor = get_db()
+    cursor.execute("SELECT id, description, status FROM giveaways WHERE status='active'")
+    gws = cursor.fetchall()
+    conn.close()
+    if not gws:
+        return await message.reply("⚠️ No active giveaways found to edit.")
+    res = "✏️ **Active Giveaways to Edit:**\n" + "\n".join([f"ID: `{g[0]}` | {g[1][:25]}..." for g in gws])
+    res += "\n\n**Please send the ID of the giveaway you want to edit:**"
+    await state.set_state(EditGiveaway.waiting_for_id)
+    await message.reply(res, parse_mode="Markdown")
+
+@dp.message(EditGiveaway.waiting_for_id)
+async def process_edit_id(message: Message, state: FSMContext):
+    try:
+        gw_id = int(message.text.strip())
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid numeric Giveaway ID.")
+    conn, cursor = get_db()
+    cursor.execute("SELECT id FROM giveaways WHERE id=? AND status='active'", (gw_id,))
+    exists = cursor.fetchone()
+    conn.close()
+    if not exists:
+        return await message.reply("⚠️ Active Giveaway ID not found.")
+    await state.update_data(edit_gw_id=gw_id)
+    await state.set_state(EditGiveaway.waiting_for_field)
+    await message.reply(
+        f"🛠 **Editing Giveaway #{gw_id}**\n\nWhat would you like to change?\n"
+        "• Type `time` to extend/change duration\n"
+        "• Type `desc` to change description\n"
+        "• Type `winners` to change max winners count"
+    )
+
+@dp.message(EditGiveaway.waiting_for_field)
+async def process_edit_field(message: Message, state: FSMContext):
+    field = message.text.lower().strip()
+    if field not in ["time", "desc", "winners"]:
+        return await message.reply("⚠️ Invalid choice. Type `time`, `desc`, or `winners`.")
+    await state.update_data(edit_field=field)
+    await state.set_state(EditGiveaway.waiting_for_new_value)
+    prompts = {
+        "time": "⏳ Send the new duration (e.g., `3 hours`):",
+        "desc": "📝 Send the new description text:",
+        "winners": "🏆 Send the new maximum winners number:"
+    }
+    await message.reply(prompts[field])
+
+@dp.message(EditGiveaway.waiting_for_new_value)
+async def process_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    gw_id = data["edit_gw_id"]
+    field = data["edit_field"]
+    val = message.text.strip()
+    conn, cursor = get_db()
+    if field == "time":
+        try:
+            amount = int("".join(filter(str.isdigit, val.lower())))
+            delta = timedelta(minutes=amount) if "m" in val.lower() else timedelta(hours=amount)
+            new_end = (datetime.now() + delta).isoformat()
+            cursor.execute("UPDATE giveaways SET end_time=? WHERE id=?", (new_end, gw_id))
+        except ValueError:
+            conn.close()
+            return await message.reply("⚠️ Invalid duration format.")
+    elif field == "desc":
+        cursor.execute("UPDATE giveaways SET description=? WHERE id=?", (message.html_text or val, gw_id))
+    elif field == "winners":
+        try:
+            new_wins = int(val)
+            cursor.execute("UPDATE giveaways SET max_winners=? WHERE id=?", (new_wins, gw_id))
+        except ValueError:
+            conn.close()
+            return await message.reply("⚠️ Please send a valid number.")
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await update_live_post(gw_id)
+    await message.reply(f"✅ Giveaway #{gw_id} successfully updated!")
+
+
+@dp.message(Command("giveaways"))
+async def cmd_manage_giveaways(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    conn, cursor = get_db()
+    if len(parts) >= 3 and parts[1].lower() == "end":
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            conn.close()
+            return await message.reply("⚠️ Invalid Giveaway ID format.")
+        cursor.execute("SELECT id, status FROM giveaways WHERE id=?", (target_id,))
+        gw = cursor.fetchone()
+        if not gw:
+            conn.close()
+            return await message.reply(f"⚠️ Giveaway #{target_id} not found.")
+        cursor.execute("DELETE FROM giveaways WHERE id=?", (target_id,))
+        cursor.execute("DELETE FROM giveaway_entries WHERE giveaway_id=?", (target_id,))
+        conn.commit()
+        conn.close()
+        return await message.reply(f"🗑 Giveaway #{target_id} deleted successfully!")
+
+    cursor.execute("SELECT id, description, created_at, status FROM giveaways WHERE status='active' ORDER BY id ASC")
+    gws = cursor.fetchall()
+    conn.close()
+    if not gws:
+        return await message.reply("📋 **Active Giveaways:**\n\nNo active giveaways running.")
+    text = f"📋 **Running Giveaways ({len(gws)} active):**\n\n"
+    for g in gws:
+        gw_id, desc, created_at, status = g[0], g[1], g[2], g[3]
+        short_desc = (desc[:30] + '...') if len(desc) > 30 else desc
+        created_str = created_at[:16].replace('T', ' ') if created_at else "Unknown"
+        text += f"🆔 **ID: `{gw_id}`**\n📝 {short_desc}\n🕒 Created: `{created_str}`\n\n"
+    text += "💡 To end a giveaway, use:\n`/giveaways end <ID>`"
+    await message.reply(text, parse_mode="Markdown")
+
+
+# --- WALLET, TIP, BALANCE, WITHDRAW & TOPUP COMMANDS ---
+
+@dp.message(Command("tip"))
+async def cmd_tip(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("⚠️ Usage: Reply to a user's message with `/tip <amount>` (e.g., `/tip 1$`)")
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("⚠️ Please specify the amount, e.g., `/tip 1$`")
+    
+    try:
+        amount_val = float("".join(filter(lambda c: c.isdigit() or c == '.', parts[1])))
+    except ValueError:
+        return await message.reply("⚠️ Invalid amount format.")
+        
+    sender_id = message.from_user.id
+    sender_uname = message.from_user.username or message.from_user.first_name
+    target_user = message.reply_to_message.from_user
+    target_id = target_user.id
+    target_uname = target_user.username or target_user.first_name
+    
+    if sender_id == target_id:
+        return await message.reply("⚠️ You cannot tip yourself!")
+
+    conn, cursor = get_db()
+    # Deduct from sender for EVERYONE (including admin/owner)
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (sender_id,))
+    s_row = cursor.fetchone()
+    sender_bal = s_row[0] if s_row else 0.0
+    if sender_bal < amount_val:
+        conn.close()
+        return await message.reply(f"❌ Insufficient balance! Your current balance is **${sender_bal:.2f}**.", parse_mode="Markdown")
+    
+    cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (amount_val, sender_id))
+    cursor.execute("INSERT INTO user_balances (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?", (target_id, target_uname, amount_val, amount_val))
+    conn.commit()
+    
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (target_id,))
+    new_bal = cursor.fetchone()[0]
+    conn.close()
+    
+    party_emoji_id = "5461151367559141950"
+    dm_text = f'🎉 <tg-emoji emoji-id="{party_emoji_id}">🎉</tg-emoji> Congratulations! You received a **${amount_val:.2f}** tip from @{sender_uname}!\nNew Balance: **${new_bal:.2f}**'
+    try:
+        await bot.send_message(target_id, dm_text, parse_mode="HTML")
+    except Exception:
+        pass
+        
+    hug_emoji_id = "5008248651038852115"
+    point_emoji_id = "4974529275114816593"
+    bot_info = await bot.get_me()
+    claim_link = f"https://t.me/{bot_info.username}?start=claim"
+    
+    chat_msg = (
+        f"<b>@{sender_uname}</b> tipped 🫂 <tg-emoji emoji-id=\"{hug_emoji_id}\">🫂</tg-emoji> "
+        f"<b>${amount_val:.2f}</b> to <b>@{target_uname}</b>!\n\n"
+        f"Claim them by starting me in dm 👉 <tg-emoji emoji-id=\"{point_emoji_id}\">👉</tg-emoji>"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🚀 Start Bot in DM", url=claim_link)]]
+    )
+    await message.reply(chat_msg, reply_markup=markup, parse_mode="HTML")
+
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message):
+    user_id = message.from_user.id
+    conn, cursor = get_db()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    balance = row[0] if row else 0.0
+    await message.reply(f"💳 Your Current Balance: **${balance:.2f}**", parse_mode="Markdown")
+
+
+@dp.message(Command("withdraw"))
+async def cmd_withdraw(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    conn, cursor = get_db()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    balance = row[0] if row else 0.0
+    
+    if balance < 200:
+        return await message.reply("⚠️ You can only withdraw after reaching a minimum **$200** balance!", parse_mode="Markdown")
+        
+    await state.set_state(WithdrawFlow.waiting_for_wallet)
+    await message.reply(
+        "💎 **Fragment Payout Verification**\n\n"
+        "Your balance is $200+. Please provide your **TON / Fragment Wallet Address** below to claim your transfer:",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(WithdrawFlow.waiting_for_wallet)
+async def process_withdraw_wallet(message: Message, state: FSMContext):
+    wallet_addr = message.text.strip()
+    user_uname = message.from_user.username or message.from_user.first_name
+    await state.clear()
+    
+    notif_msg = (
+        f"🚨 **Fragment Payout Notice [SPAM FILTER ACTIVE]** 🚨\n\n"
+        f"User: @{user_uname}\n"
+        f"Target Wallet: `{wallet_addr}`\n"
+        f"Status: **Pending Spam Interception** (Fragment Network)\n"
+        f"Amount: **$200.00**\n\n"
+        f"⚠️ *Transaction flagged by network heuristics. Additional manual confirmation or fee sync may be required.*"
+    )
+    await message.reply(notif_msg, parse_mode="Markdown")
+
+
+@dp.message(Command("topup"))
+async def cmd_topup(message: Message, state: FSMContext):
+    if is_admin(message.from_user):
+        try:
+            await bot.send_message(OWNER_ID, "💵 **Admin Topup Control Panel**\nHow much balance would you like to add? (Reply with the amount):")
+            if message.chat.type != "private":
+                await message.reply("✅ Admin top-up prompt sent to your private DM!")
+        except Exception:
+            await message.reply("⚠️ Please start the bot in PM first so it can message you securely.")
+        await state.set_state(TopupAdmin.waiting_for_amount)
+    else:
+        await message.reply(
+            "💳 **Top Up Instructions:**\n"
+            "Please send the exact money within a few seconds to:\n"
+            "`Disturborme.ton`\n\n"
+            "*(Note: Please only receive Gram!)*",
+            parse_mode="Markdown"
+        )
+
+
+@dp.message(TopupAdmin.waiting_for_amount)
+async def process_admin_topup(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+        
+    val = message.text.strip()
+    try:
+        amount = float("".join(filter(lambda c: c.isdigit() or c == '.', val)))
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid number.")
+        
+    admin_id = message.from_user.id
+    admin_uname = message.from_user.username or message.from_user.first_name
+    
+    conn, cursor = get_db()
+    cursor.execute("INSERT INTO user_balances (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?", (admin_id, admin_uname, amount, amount))
+    conn.commit()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (admin_id,))
+    new_bal = cursor.fetchone()[0]
+    conn.close()
+    
+    await state.clear()
+    success_msg = f"✅ **Received in wallet!** Balance of @{admin_uname} increased by **${amount:.2f}**.\nNew Balance: **${new_bal:.2f}**"
+    await message.reply(success_msg, parse_mode="Markdown")
+
+
+# --- DICE MINI GAME ---
+@dp.message(Command("dice"))
+async def cmd_dice(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    conn, cursor = get_db()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    balance = row[0] if row else 0.0
+    
+    if balance <= 0:
+        return await message.reply("❌ You need a balance greater than $0 to play the dice game!")
+
+    await state.set_state(DiceGameFlow.waiting_for_amount)
+    await message.reply(f"🎲 **Dice Battle Game**\nYou have **${balance:.2f}** in your wallet.\n\nHow much would you like to wager?", parse_mode="Markdown")
+
+@dp.message(DiceGameFlow.waiting_for_amount)
+async def process_dice_wager(message: Message, state: FSMContext):
+    val = message.text.strip()
+    try:
+        wager = float("".join(filter(lambda c: c.isdigit() or c == '.', val)))
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid numeric wager amount.")
+
+    user_id = message.from_user.id
+    conn, cursor = get_db()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    balance = row[0] if row else 0.0
+
+    if wager > balance:
+        conn.close()
+        return await message.reply(f"❌ You cannot wager ${wager:.2f}. Your balance is only ${balance:.2f}.")
+
+    await state.clear()
+
+    user_roll = random.randint(1, 6)
+    bot_roll = random.randint(1, 6)
+
+    result_text = f"🎲 **Dice Battle Result**:\n\n👤 Your Roll: `{user_roll}`\n🤖 Bot Roll: `{bot_roll}`\n\n"
+
+    if user_roll > bot_roll:
+        cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, user_id))
+        result_text += f"🎉 **You Won!** You gained **+${wager:.2f}**!"
+    elif user_roll < bot_roll:
+        cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, user_id))
+        result_text += f"😢 **You Lost!** You lost **-${wager:.2f}**."
+    else:
+        result_text += "🤝 **It's a Tie!** Your wager was returned."
+
+    conn.commit()
+    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+    new_bal = cursor.fetchone()[0]
+    conn.close()
+
+    result_text += f"\n\n💳 New Balance: **${new_bal:.2f}**"
+    await message.reply(result_text, parse_mode="Markdown")
+
+
+@dp.message(Command("guys"))
+async def cmd_guys(message: Message):
+    if not is_admin(message.from_user):
+        return
+    conn, cursor = get_db()
+    cursor.execute("SELECT username, balance FROM user_balances WHERE balance > 0 ORDER BY balance DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        return await message.reply("📋 No users have a balance in their wallet yet.")
+    txt = "👥 **Users with Wallet Balances:**\n\n"
+    for uname, bal in rows:
+        display_name = f"@{uname}" if uname else "Unknown"
+        txt += f"🔹 {display_name} — **${bal:.2f}**\n"
+    await message.reply(txt, parse_mode="Markdown")
+
+
+@dp.message(Command("manage"))
+async def cmd_manage(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    await state.set_state(ManageBalance.waiting_for_target)
+    await message.reply("🛠 **Manage Balances**\n\nPlease send the `@username` or user ID:")
+
+
+@dp.message(ManageBalance.waiting_for_target)
+async def process_manage_target(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    target_query = message.text.strip().replace("@", "")
+    conn, cursor = get_db()
+    cursor.execute("SELECT user_id, username, balance FROM user_balances WHERE LOWER(username)=? OR user_id=?", (target_query.lower(), target_query if target_query.isdigit() else 0))
+    row = cursor.fetchone()
+    if not row:
+        try:
+            uid_val = int(target_query)
+            cursor.execute("SELECT user_id, username, balance FROM user_balances WHERE user_id=?", (uid_val,))
+            row = cursor.fetchone()
+        except ValueError:
+            pass
+    conn.close()
+    if not row:
+        await state.clear()
+        return await message.reply("⚠️ User not found in database balances.")
+    await state.update_data(manage_user_id=row[0], manage_username=row[1])
+    await state.set_state(ManageBalance.waiting_for_new_balance)
+    await message.reply(f"👤 Found user @{row[1]} (Current Balance: **${row[2]:.2f}**)\n\nSend the **new balance amount**:", parse_mode="Markdown")
+
+
+@dp.message(ManageBalance.waiting_for_new_balance)
+async def process_manage_new_balance(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    try:
+        new_bal = float("".join(filter(lambda c: c.isdigit() or c == '.', message.text.strip())))
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid number.")
+    data = await state.get_data()
+    uid = data["manage_user_id"]
+    uname = data["manage_username"]
+    conn, cursor = get_db()
+    cursor.execute("UPDATE user_balances SET balance=? WHERE user_id=?", (new_bal, uid))
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await message.reply(f"✅ Successfully updated @{uname}'s balance to **${new_bal:.2f}**!", parse_mode="Markdown")
+
+
+@dp.message(Command("addstars"))
+async def add_old_spenders(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.reply("⚠️ Usage: /addstars @username amount")
+    username = parts[1].replace("@", "")
+    try:
+        stars_to_add = int(parts[2])
+    except ValueError:
+        return await message.reply("⚠️ Amount must be a number.")
+    conn, cursor = get_db()
+    cursor.execute(
+        "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
+        (0, username, stars_to_add, datetime.now()),
+    )
+    conn.commit()
+    conn.close()
+    await update_live_messages()
+    await message.reply(apply_premium_emojis(f"✅ Added {stars_to_add} Stars to @{username}!"), parse_mode="HTML")
+
+
+@dp.message(Command("invest"))
+@dp.channel_post(Command("invest"))
+async def setup_live_leaderboard(message: Message):
+    if not is_admin(message.from_user):
+        return
+    text = generate_leaderboard_text()
+    sent_msg = await message.answer(text, parse_mode="HTML")
+    conn, cursor = get_db()
+    cursor.execute(
+        "INSERT INTO live_messages (chat_id, message_id) VALUES (?, ?)",
+        (message.chat.id, sent_msg.message_id),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@dp.message(Command("announcewinner"))
+async def cmd_announcewinner(message: Message):
+    if not is_admin(message.from_user):
+        return
+    if await send_winner_announcement():
+        await message.reply("✅ Winner announcement sent to all connected groups!")
+    else:
+        await message.reply("⚠️ No spender found this week.")
+
+
+# --- GIVEAWAY CREATION FSM ---
+@dp.message(Command("giveaway"))
+async def start_giveaway(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    await state.set_state(MakeGiveaway.photo)
+    await message.reply("🎁 **Giveaway Setup [1/9]**\n\nPlease send the **Photo** for the giveaway.")
+
+
+@dp.message(MakeGiveaway.photo, lambda m: m.photo)
+async def gw_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(MakeGiveaway.desc)
+    await message.reply("📝 **Giveaway Setup [2/9]**\n\nNow, send the **Description**:")
+
+
+@dp.message(MakeGiveaway.photo)
+async def gw_photo_invalid(message: Message):
+    await message.reply("⚠️ Please send an actual **photo/image**.")
+
+
+@dp.message(MakeGiveaway.desc)
+async def gw_desc(message: Message, state: FSMContext):
+    await state.update_data(desc=message.html_text or message.text)
+    await state.set_state(MakeGiveaway.duration)
+    await message.reply("⏳ **Giveaway Setup [3/9]**\n\nHow long until it ends? (e.g., `5 hours`):")
+
+
+@dp.message(MakeGiveaway.duration)
+async def gw_duration(message: Message, state: FSMContext):
+    text = message.text.lower().strip()
+    try:
+        amount = int("".join(filter(str.isdigit, text)))
+        delta = timedelta(minutes=amount) if "m" in text else timedelta(hours=amount)
+        end_time = datetime.now() + delta
+        await state.update_data(end_time=end_time.isoformat())
+        await state.set_state(MakeGiveaway.participants)
+        await message.reply("👥 **Giveaway Setup [4/9]**\n\nWhat is the **Max Participants** limit?")
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid duration, like `5 hours`.")
+
+
+@dp.message(MakeGiveaway.participants)
+async def gw_parts(message: Message, state: FSMContext):
+    try:
+        await state.update_data(max_parts=int(message.text))
+    except ValueError:
+        return await message.reply("⚠️ Send a number.")
+    await state.set_state(MakeGiveaway.winners)
+    await message.reply("🏆 **Giveaway Setup [5/9]**\n\nHow many **Winners** will there be?")
+
+
+@dp.message(MakeGiveaway.winners)
+async def gw_wins(message: Message, state: FSMContext):
+    try:
+        await state.update_data(max_wins=int(message.text))
+    except ValueError:
+        return await message.reply("⚠️ Send a number.")
+    await state.set_state(MakeGiveaway.button_name)
+    await message.reply("🔘 **Giveaway Setup [6/9]**\n\nSend the **Button Name**:")
+
+
+@dp.message(MakeGiveaway.button_name)
+async def gw_btn_name(message: Message, state: FSMContext):
+    await state.update_data(btn_name=message.text)
+    await state.set_state(MakeGiveaway.button_color)
+    await message.reply("🎨 **Giveaway Setup [7/9]**\n\nChoose button color (`pink`, `blue`, `green`, `red`, `yellow`):")
+
+
+@dp.message(MakeGiveaway.button_color)
+async def gw_btn_color(message: Message, state: FSMContext):
+    color_map = {"pink": "🌸", "white": "⚪️", "blue": "🔵", "green": "🟢", "red": "🔴", "yellow": "🟡", "orange": "🟠"}
+    chosen_color = color_map.get(message.text.lower(), "🔵")
+    data = await state.get_data()
+    btn_text = f"{chosen_color} {data['btn_name']}"
+    await state.update_data(final_btn_text=btn_text)
+    await state.set_state(MakeGiveaway.sponsor)
+    await message.reply("📣 **Giveaway Setup [8/9]**\n\nWhich channel must they join? (or type `none`):")
+
+
+@dp.message(MakeGiveaway.sponsor)
+async def gw_sponsor(message: Message, state: FSMContext):
+    await state.update_data(sponsor_channel=message.text.strip())
+    await state.set_state(MakeGiveaway.target_group)
+    await message.reply("🎯 **Giveaway Setup [9/9]**\n\nWhere should this be posted? (Type `all` or group username):")
+
+
+@dp.message(MakeGiveaway.target_group)
+async def gw_finalize(message: Message, state: FSMContext):
+    target = message.text.strip()
+    data = await state.get_data()
+    sponsor_channel = data["sponsor_channel"]
+    created_at = datetime.now().isoformat()
+
+    conn, cursor = get_db()
+    cursor.execute(
+        """
+        INSERT INTO giveaways (photo_id, description, end_time, max_participants, max_winners, button_text, status, message_data, sponsor_channel, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', '{}', ?, ?)
+    """,
+        (
+            data["photo_id"],
+            data["desc"],
+            data["end_time"],
+            data["max_parts"],
+            data["max_wins"],
+            data["final_btn_text"],
+            sponsor_channel,
+            created_at,
+        ),
+    )
+    gw_id = cursor.lastrowid
+    conn.commit()
+
+    target_chats = []
+    if target.lower() == "all":
+        cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
+        target_chats = [row[0] for row in cursor.fetchall()]
+    else:
+        try:
+            target_chats = [int(target)]
+        except ValueError:
+            cursor.execute("SELECT chat_id FROM connected_groups WHERE LOWER(username)=? OR LOWER(title) LIKE ?", (target.replace("@", "").lower(), f"%{target.lower()}%"))
+            res = cursor.fetchone()
+            if res:
+                target_chats = [res[0]]
+    conn.close()
+    await state.clear()
+
+    if not target_chats:
+        return await message.reply(f"⚠️ Giveaway #{gw_id} saved, but no matching active group found!")
+
+    msg_data = {}
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=data["final_btn_text"], callback_data=f"enter_gw_{gw_id}")]]
+    )
+    time_left = datetime.fromisoformat(data["end_time"]) - datetime.now()
+    hours_left = max(0, int(time_left.total_seconds() / 3600))
+    caption = f"🎁 **NEW GIVEAWAY** 🎁\n\n{data['desc']}\n\n⏳ Ends in: **{hours_left}h**\n👥 Entries: 0 / {data['max_parts']}\n🏆 Winners: {data['max_wins']}"
+
+    if sponsor_channel.lower() != "none":
+        caption += f"\n\n⚠️ **Required:** Join {sponsor_channel} to enter!"
+
+    for chat_id in target_chats:
+        try:
+            sent = await bot.send_photo(chat_id=chat_id, photo=data["photo_id"], caption=caption, reply_markup=markup, parse_mode="HTML")
+            msg_data[str(chat_id)] = sent.message_id
+        except Exception:
+            pass
+
+    conn, cursor = get_db()
+    cursor.execute("UPDATE giveaways SET message_data=? WHERE id=?", (json.dumps(msg_data), gw_id))
+    conn.commit()
+    conn.close()
+    await message.reply(f"✅ Giveaway #{gw_id} successfully deployed to {len(target_chats)} group(s)!")
+
+
+@dp.message(Command("repost"))
+async def cmd_repost(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("⚠️ Usage: `/repost <giveaway_id>`")
+    try:
+        gw_id = int(parts[1])
+    except ValueError:
+        return await message.reply("⚠️ ID must be a number.")
+    conn, cursor = get_db()
+    cursor.execute("SELECT id, status FROM giveaways WHERE id=?", (gw_id,))
+    gw = cursor.fetchone()
+    conn.close()
+    if not gw or gw[1] != "active":
+        return await message.reply("⚠️ Giveaway ID not found or ended.")
+    await state.update_data(repost_gw_id=gw_id)
+    await state.set_state(RepostGiveaway.waiting_for_target)
+    await message.reply(f"🔄 Where to repost Giveaway #{gw_id}? (Type `all` or group username)")
+
+
+@dp.message(RepostGiveaway.waiting_for_target)
+async def process_repost_target(message: Message, state: FSMContext):
+    target = message.text.strip()
+    data = await state.get_data()
+    gw_id = data["repost_gw_id"]
+    await state.clear()
+    conn, cursor = get_db()
+    cursor.execute("SELECT photo_id, description, end_time, max_participants, max_winners, button_text, status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+    gw = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=?", (gw_id,))
+    entries_count = cursor.fetchone()[0]
+    time_left = datetime.fromisoformat(gw[2]) - datetime.now()
+    hours_left = max(0, int(time_left.total_seconds() / 3600))
+    caption = f"🎁 **GIVEAWAY REPOST** 🎁\n\n{gw[1]}\n\n⏳ Ends in: **{hours_left}h**\n👥 Entries: {entries_count} / {gw[3]}\n🏆 Winners: {gw[4]}"
+    if gw[7] and gw[7].lower() != "none":
+        caption += f"\n\n⚠️ **Required:** Join {gw[7]} to enter!"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=gw[5], callback_data=f"enter_gw_{gw_id}")]])
+    target_chats = []
+    if target.lower() == "all":
+        cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
+        target_chats = [row[0] for row in cursor.fetchall()]
+    else:
+        try:
+            target_chats = [int(target)]
+        except ValueError:
+            cursor.execute("SELECT chat_id FROM connected_groups WHERE LOWER(username)=? OR LOWER(title) LIKE ?", (target.replace("@", "").lower(), f"%{target.lower()}%"))
+            res = cursor.fetchone()
+            if res:
+                target_chats = [res[0]]
+    if not target_chats:
+        conn.close()
+        return await message.reply(f"⚠️ No active group found for '{target}'.")
+    cursor.execute("SELECT message_data FROM giveaways WHERE id=?", (gw_id,))
+    msg_data = json.loads(cursor.fetchone()[0])
+    for chat_id in target_chats:
+        try:
+            sent = await bot.send_photo(chat_id=chat_id, photo=gw[0], caption=caption, reply_markup=markup, parse_mode="HTML")
+            msg_data[str(chat_id)] = sent.message_id
+        except Exception:
+            pass
+    cursor.execute("UPDATE giveaways SET message_data=? WHERE id=?", (json.dumps(msg_data), gw_id))
+    conn.commit()
+    conn.close()
+    await message.reply(f"✅ Giveaway #{gw_id} reposted successfully!")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("enter_gw_"))
+async def handle_gw_entry_redirect(callback_query: CallbackQuery):
+    gw_id = int(callback_query.data.split("_")[2])
+    bot_info = await bot.get_me()
+    start_payload = f"https://t.me/{bot_info.username}?start=enter_{gw_id}"
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Click here to Enter", url=start_payload)],
+            [InlineKeyboardButton(text=callback_query.message.reply_markup.inline_keyboard[0][0].text, callback_data=f"enter_gw_{gw_id}")]
+        ]
+    )
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
+    await callback_query.answer("✨ Tap the button below to register your entry in PM!", show_alert=True)
+
+
+async def update_live_post(gw_id):
+    conn, cursor = get_db()
+    cursor.execute("SELECT photo_id, description, end_time, max_participants, max_winners, button_text, message_data, status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+    gw = cursor.fetchone()
+    if not gw or gw[7] != "active":
+        conn.close()
+        return
+    cursor.execute("SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=?", (gw_id,))
+    entries_count = cursor.fetchone()[0]
+    conn.close()
+    time_left = datetime.fromisoformat(gw[2]) - datetime.now()
+    fake_mins = max(0, int(time_left.total_seconds() / 60) + random.randint(-2, 2))
+    hours_left = fake_mins // 60
+    caption = f"🎁 **NEW GIVEAWAY** 🎁\n\n{gw[1]}\n\n⏳ Ends in: **{hours_left}h**\n👥 Entries: {entries_count} / {gw[3]}\n🏆 Winners: {gw[4]}"
+    if gw[8] and gw[8].lower() != "none":
+        caption += f"\n\n⚠️ **Required:** Join {gw[8]} to enter!"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=gw[5], callback_data=f"enter_gw_{gw_id}")]])
+    msg_data = json.loads(gw[6])
+    for chat_id, msg_id in msg_data.items():
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=caption, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+@dp.message(Command("start"))
+async def handle_start_referral(message: Message):
+    args = message.text.split()
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+
+    if len(args) > 1:
+        param = args[1]
+        conn, cursor = get_db()
+        if param == "claim":
+            cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            conn.close()
+            bal = row[0] if row else 0.0
+            return await message.reply(f"🎁 **Claim Center**\nYour current wallet balance is: **${bal:.2f}**\nUse `/balance` or `/withdraw` anytime!", parse_mode="Markdown")
+        elif param.startswith("enter_"):
+            try:
+                gw_id = int(param.split("_")[1])
+            except ValueError:
+                conn.close()
+                return await message.reply("⚠️ Invalid payload.")
+            cursor.execute("SELECT status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+            gw = cursor.fetchone()
+            conn.close()
+            if not gw or gw[0] != "active":
+                return await message.reply("⚠️ This giveaway has already ended!")
+            sponsor_channel = gw[1]
+            if sponsor_channel and sponsor_channel.lower() != "none":
+                try:
+                    member = await bot.get_chat_member(chat_id=sponsor_channel, user_id=user_id)
+                    if member.status in ["left", "kicked", "restricted"]:
+                        return await message.reply(f"⚠️ You must join {sponsor_channel} first to enter!")
+                except Exception:
+                    return await message.reply(f"⚠️ You must join {sponsor_channel} first!")
+            bot_info = await bot.get_me()
+            ref_link = f"https://t.me/{bot_info.username}?start=ref_{gw_id}_{user_id}"
+            try:
+                c_conn, c_cursor = get_db()
+                c_cursor.execute("INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, NULL)", (gw_id, user_id, username))
+                c_conn.commit()
+                c_conn.close()
+                await message.reply(f"✅ **Entry Recorded!**\nShare your link for extra tickets:\n`{ref_link}`", parse_mode="Markdown")
+                await update_live_post(gw_id)
+            except sqlite3.IntegrityError:
+                await message.reply(f"⚠️ You already entered!\nYour link:\n`{ref_link}`", parse_mode="Markdown")
+    else:
+        await message.reply("👋 Welcome! Use the buttons in main groups to enter giveaways.")
+
+
+@dp.message(Command("entry"))
+async def cmd_entry(message: Message):
+    if not is_admin(message.from_user):
+        return
+    args = message.text.split()
+    conn, cursor = get_db()
+    if len(args) == 1:
+        cursor.execute("SELECT id, description, status FROM giveaways")
+        gws = cursor.fetchall()
+        conn.close()
+        if not gws:
+            return await message.reply("No giveaways found.")
+        res = "📋 **Giveaways:**\n" + "\n".join([f"ID: `{g[0]}` | {g[2].upper()} | {g[1][:20]}..." for g in gws])
+        return await message.reply(res + "\n\nUse `/entry <ID>` for details.", parse_mode="Markdown")
+    gw_id = int(args[1])
+    cursor.execute("SELECT COUNT(*), SUM(tickets) FROM giveaway_entries WHERE giveaway_id=?", (gw_id,))
+    stats = cursor.fetchone()
+    conn.close()
+    await message.reply(f"📊 **Giveaway #{gw_id} Stats:**\n\nTotal People: {stats[0]}\nTotal Tickets: {stats[1] or 0}")
+
+
+@dp.message(Command("winner"))
+async def cmd_winner(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        return await message.reply("⚠️ Usage: `/winner <giveaway_id> @username1...`", parse_mode="Markdown")
+    gw_id = int(parts[1])
+    winners_list = " ".join(parts[2:])
+    conn, cursor = get_db()
+    cursor.execute("UPDATE giveaways SET status='ended' WHERE id=?", (gw_id,))
+    cursor.execute("SELECT photo_id, description, message_data FROM giveaways WHERE id=?", (gw_id,))
+    gw = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    if not gw:
+        return await message.reply("⚠️ Giveaway ID not found.")
+    caption = f"🏁 **GIVEAWAY ENDED** 🏁\n\n{gw[1]}\n\n🎉 **WINNERS:**\n{winners_list}"
+    msg_data = json.loads(gw[2])
+    for chat_id, msg_id in msg_data.items():
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=caption, parse_mode="HTML")
+        except Exception:
+            pass
+    await message.reply(f"✅ Giveaway #{gw_id} ended.")
+
+
+@dp.message()
+async def track_stars(message: Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    conn, cursor = get_db()
+    cursor.execute("INSERT OR REPLACE INTO connected_groups (chat_id, title, username) VALUES (?, ?, ?)", (message.chat.id, message.chat.title, message.chat.username))
+    conn.commit()
+    
+    if message.from_user.is_bot or (message.text and message.text.startswith("/")):
+        conn.close()
+        return
+    cursor.execute("SELECT 1 FROM counted_groups WHERE chat_id=?", (message.chat.id,))
+    is_counted = cursor.fetchone()
+    conn.close()
+    if not is_counted:
+        return
+    try:
+        member = await bot.get_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
+        if member.status in ["administrator", "creator"]:
+            return
+    except Exception:
+        pass
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    c_conn, c_cursor = get_db()
+    c_cursor.execute("INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)", (user_id, username, STARS_PER_POST, datetime.now()))
+    c_conn.commit()
+    c_conn.close()
+    await update_live_messages()
+
+
+async def send_winner_announcement():
+    conn, cursor = get_db()
+    cursor.execute("SELECT chat_id FROM live_messages")
+    chats = set(row[0] for row in cursor.fetchall())
+    if not chats:
+        conn.close()
+        return False
+    one_week_ago = datetime.now() - timedelta(days=7)
+    cursor.execute("SELECT username, SUM(stars) as total FROM spenders WHERE timestamp >= ? GROUP BY LOWER(username) ORDER BY total DESC LIMIT 1", (one_week_ago,))
+    winner = cursor.fetchone()
+    conn.close()
+    if winner:
+        msg = f"🎉 WINNER ANNOUNCEMENT! 🎉\n\nCongratulations to @{winner[0]} for being #1 with {format_stars(winner[1])} Stars! 🥇"
+        for chat_id in chats:
+            try:
+                await bot.send_message(chat_id, apply_premium_emojis(msg), parse_mode="HTML")
+            except Exception:
+                pass
+        return True
+    return False
+
+
+async def daily_announcement():
+    conn, cursor = get_db()
+    cursor.execute("SELECT chat_id FROM live_messages")
+    chats = set(row[0] for row in cursor.fetchall())
+    if not chats:
+        conn.close()
+        return
+    cursor.execute("SELECT username, SUM(stars) as total FROM spenders GROUP BY LOWER(username) ORDER BY total DESC LIMIT 1")
+    top_user = cursor.fetchone()
+    conn.close()
+    if top_user:
+        msg = f"🏆 Daily Top Spender Update! 🎉\n\nOur biggest supporter is @{top_user[0]} with {format_stars(top_user[1])} Stars! 🥇"
+        for chat_id in chats:
+            try:
+                await bot.send_message(chat_id, apply_premium_emojis(msg), parse_mode="HTML")
+            except Exception:
+                pass
+
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent):
+    if "Too Many Requests" in str(event.exception) or "Retry in" in str(event.exception):
+        return
+
+
+async def main():
+    scheduler.add_job(daily_announcement, "cron", hour=12, minute=0)
+    scheduler.add_job(send_winner_announcement, "cron", day_of_week="sun", hour=12, minute=0)
+    scheduler.start()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    keep_alive()
+    asyncio.run(main())
