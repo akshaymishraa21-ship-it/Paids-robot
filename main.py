@@ -456,4 +456,4 @@ async def cmd_manage_giveaways(message: Message):
         cursor.execute("SELECT id, status FROM giveaways WHERE id=?", (target_id,))
         gw = cursor.fetchone()
         if not gw:
-            return await message.reply(f"⚠️ Giveaway #{target_id} not
+return await message.reply(f"Giveaway #{target_id} not found.")
